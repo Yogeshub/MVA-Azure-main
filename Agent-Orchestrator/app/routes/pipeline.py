@@ -7,6 +7,8 @@ Each future agent added to the pipeline becomes another node in that same graph.
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import httpx
+import re
+from typing import Literal
 
 from app.agents.orchestration_agent.graph import run_orchestrator_pipeline
 from app.agents.orchestration_agent.nodes.pipeline import (
@@ -15,6 +17,17 @@ from app.agents.orchestration_agent.nodes.pipeline import (
 from app.config import settings
 
 router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
+
+ExplanationMode = Literal["Concise", "Standard", "Detailed", "Executive", "Step by Step"]
+Persona = Literal["Finance Analyst", "CFO", "Auditor", "Business User", "Technical User", "Custom Persona"]
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean_custom_persona(persona: str | None, custom_persona: str | None) -> str | None:
+    cleaned = _CONTROL_CHARS.sub("", custom_persona or "").strip()[:500]
+    if persona == "Custom Persona" and not cleaned:
+        raise HTTPException(status_code=422, detail="custom_persona is required when persona is Custom Persona.")
+    return cleaned or None
 
 
 @router.post("/run")
@@ -49,6 +62,9 @@ async def run_pipeline(
         description="Optional explicit override — if the caller already knows the target column, "
                     "Agent 2 skips LLM target-guessing and uses it directly.",
     ),
+    explanation_mode: ExplanationMode | None = Form(default=None),
+    persona: Persona | None = Form(default=None),
+    custom_persona: str | None = Form(default=None),
 ):
     """
     Runs a dataset through the full agent pipeline:
@@ -103,6 +119,7 @@ async def run_pipeline(
     form = await request.form()
     request_rules = form.get("request_rules")
     request_rules = str(request_rules) if request_rules else None
+    custom_persona = _clean_custom_persona(persona, custom_persona)
 
     return await run_orchestrator_pipeline(
         filename=filename,
@@ -114,6 +131,9 @@ async def run_pipeline(
         business_question=business_question,
         target_column=target_column,
         request_rules=request_rules,
+        explanation_mode=explanation_mode,
+        persona=persona,
+        custom_persona=custom_persona,
     )
 
 
@@ -128,6 +148,9 @@ async def ask_agent3(
         ..., description="Agent 2's run_id from an earlier POST /pipeline/run response "
                           "(the agent2.run_id field)."
     ),
+    explanation_mode: ExplanationMode | None = Form(default=None),
+    persona: Persona | None = Form(default=None),
+    custom_persona: str | None = Form(default=None),
 ):
     """
     Re-ask Agent 3 a different business_question against a dataset that
@@ -156,6 +179,7 @@ async def ask_agent3(
         )
     filename = file.filename or "upload"
     content_type = file.content_type or "application/octet-stream"
+    custom_persona = _clean_custom_persona(persona, custom_persona)
 
     try:
         status_code, body = await _get_agent2_result(run_id)
@@ -192,5 +216,6 @@ async def ask_agent3(
         business_question, filename, content, content_type,
         ml_score, llm_score, feature_columns, ml_breakdown, llm_breakdown,
         column_profiles, hierarchy, charts, full_feature_recommendation, primary_domain,
+        explanation_mode, persona, custom_persona,
     )
     return {"agent3": agent3_body, "primary_domain_used": primary_domain}

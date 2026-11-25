@@ -11,6 +11,7 @@ user: "refuse unless forced" over "always allow").
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from app.services.dataset_registry import metadata_cache, storage
 
@@ -116,3 +117,48 @@ def delete_master(fingerprint: str, force: bool) -> tuple[bool, str | None]:
     metadata_cache.delete_master_dataset(fingerprint)
     storage.delete_master_file(row["storage_location"])
     return True, None
+
+
+def delete_dataset(
+    dataset_id: str,
+    *,
+    requested_by: str = "unknown",
+) -> dict[str, Any] | None:
+    """Delete every stored version of a dataset_id and report cleanup status.
+
+    Logical deletion and its tombstone commit together.  Physical deletion is
+    then attempted through the storage abstraction.  Failed objects remain in
+    the audit as explicit orphans and are retried by an identical DELETE.
+    """
+    audit, created = metadata_cache.begin_dataset_deletion(
+        dataset_id,
+        requested_by=requested_by,
+    )
+    if audit is None:
+        return None
+
+    status = audit["status"]
+    if status == "deleted":
+        result = dict(audit)
+        result["idempotent"] = True
+        return result
+
+    claim = metadata_cache.claim_dataset_cleanup(dataset_id)
+    if claim is None:
+        result = dict(audit)
+        result["idempotent"] = True
+        return result
+
+    claim_id, locations = claim
+    failed: list[str] = []
+    for location in locations:
+        if not storage.delete_master_file(location):
+            failed.append(location)
+
+    updated = metadata_cache.finish_dataset_deletion(
+        dataset_id,
+        claim_id=claim_id,
+        failed_locations=failed,
+    )
+    updated["idempotent"] = not created
+    return updated

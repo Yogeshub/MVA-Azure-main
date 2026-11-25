@@ -668,9 +668,14 @@ def _generate_drill_down_cubes(settings, df, charts, hierarchy_levels, sem_candi
                 count = int(group_metric.count())
                 if count < min_group:
                     continue
+                if count == 0:
+                    # No numeric values in this group. Omitting it is the only
+                    # honest option — a 0 here would be indistinguishable from a
+                    # real zero measurement once the source rows have aged out.
+                    continue
                 agg_data.append({
                     "label": str(label),
-                    "value": round(float(group_metric.sum()), 2) if not group_metric.isna().all() else 0,
+                    "value": round(float(group_metric.sum()), 2),
                     "count": count,
                 })
             if agg_data:
@@ -700,9 +705,14 @@ def _generate_drill_down_cubes(settings, df, charts, hierarchy_levels, sem_candi
                     count = int(group_metric.count())
                     if count < min_group:
                         continue
+                    if count == 0:
+                        # No numeric values in this group. Omitting it is the only
+                        # honest option — a 0 here would be indistinguishable from a
+                        # real zero measurement once the source rows have aged out.
+                        continue
                     agg_data.append({
                         "label": str(label),
-                        "value": round(float(group_metric.sum()), 2) if not group_metric.isna().all() else 0,
+                        "value": round(float(group_metric.sum()), 2),
                         "count": count,
                     })
                 if agg_data:

@@ -7,7 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.routes.aggregate import router as aggregate_router
 from app.routes.datasets import router as datasets_router
+from app.routes.objectives import router as objectives_router
 from app.routes.pipeline import router as pipeline_router
 from app.services.dataset_registry import metadata_cache
 
@@ -29,10 +31,28 @@ async def lifespan(app: FastAPI):
     for."""
     logger.info("Starting Agent Orchestrator...")
     metadata_cache.init_db()
-    try:
-        Path(settings.MASTER_DATASET_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        logger.error(f"Failed to create master dataset storage dir — Dataset Registry cache disabled: {e}")
+    backend = (settings.MASTER_DATASET_BACKEND or "local").strip().lower()
+    if backend == "blob":
+        auth_mode = (
+            "connection_string"
+            if settings.AZURE_BLOB_CONNECTION_STRING
+            else "managed_identity"
+        )
+        logger.info(
+            "master_dataset_storage_config | backend=blob | container=%s | prefix=%s | auth=%s",
+            settings.AZURE_BLOB_CONTAINER or "<missing>",
+            settings.AZURE_BLOB_PREFIX or "<root>",
+            auth_mode,
+        )
+    else:
+        logger.info(
+            "master_dataset_storage_config | backend=local | directory=%s",
+            settings.MASTER_DATASET_STORAGE_DIR,
+        )
+        try:
+            Path(settings.MASTER_DATASET_STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Failed to create master dataset storage dir — Dataset Registry cache disabled: {e}")
     logger.info("Agent Orchestrator ready.")
     yield
     logger.info("Shutting down Agent Orchestrator.")
@@ -59,7 +79,9 @@ app.add_middleware(
 )
 
 app.include_router(pipeline_router)
+app.include_router(aggregate_router)
 app.include_router(datasets_router)
+app.include_router(objectives_router)
 
 
 async def _ping(client: httpx.AsyncClient, name: str, url: str) -> dict:

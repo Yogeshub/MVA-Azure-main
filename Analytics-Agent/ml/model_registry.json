@@ -2,26 +2,40 @@
   "models": {
     "lightgbm_regressor": {
       "algorithm": "LightGBM",
-      "target": "revenue",
-      "r2": 0.5453495361627355,
-      "timestamp": "2026-07-30T08:34:17.580644"
+      "target": "underwriting_result_actual",
+      "r2": 0.8967,
+      "rmse": 11052.06,
+      "train_rows": 800,
+      "test_rows": 200,
+      "timestamp": "2026-08-17T18:43:16.786325"
     },
     "isolation_forest": {
       "algorithm": "IsolationForest",
       "anomaly_count": 50,
-      "total_records": 1000,
+      "anomaly_rate_pct": 5.0,
       "contamination": 0.05,
-      "timestamp": "2026-07-30T08:34:14.467085"
+      "feature_columns": [
+        "loss_ratio_actual",
+        "expense_ratio_actual",
+        "combined_ratio_actual",
+        "claim_frequency_actual",
+        "average_claim_severity_actual",
+        "reserve_adequacy_ratio_actual",
+        "policy_lapse_rate_actual",
+        "renewal_rate_actual",
+        "premium_collection_rate_actual"
+      ],
+      "timestamp": "2026-08-17T18:43:18.266184"
     },
     "xgboost_classifier": {
       "algorithm": "XGBoost",
       "target": "primary_variance_driver",
       "accuracy": 0.718,
-      "f1_macro": 0.5551,
-      "accuracy_cv_std": 0.0337,
-      "f1_macro_cv_std": 0.0749,
-      "single_split_accuracy": 0.68,
-      "single_split_f1_macro": 0.5057,
+      "f1_macro": 0.5481,
+      "accuracy_cv_std": 0.0266,
+      "f1_macro_cv_std": 0.0646,
+      "single_split_accuracy": 0.675,
+      "single_split_f1_macro": 0.4887,
       "classes": [
         "ACQUISITION COST",
         "CLAIM FREQUENCY",
@@ -34,12 +48,17 @@
       ],
       "train_rows": 800,
       "test_rows": 200,
-      "timestamp": "2026-07-16T18:53:58.122389"
+      "timestamp": "2026-08-17T18:43:41.752925"
     },
     "kmeans_segmentation": {
       "algorithm": "KMeans",
       "n_clusters": 3,
-      "timestamp": "2026-07-30T08:34:17.019598"
+      "distribution": {
+        "0": 547,
+        "1": 105,
+        "2": 348
+      },
+      "timestamp": "2026-08-17T18:43:43.073521"
     },
     "prophet_forecast": {
       "algorithm": "Prophet",

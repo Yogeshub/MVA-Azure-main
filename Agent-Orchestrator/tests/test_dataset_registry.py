@@ -22,7 +22,8 @@ from app.services.dataset_registry.dataset_registry import DatasetRegistry
 from app.services.dataset_registry.fingerprint import compute_fingerprint
 from app.services.dataset_registry.models import CachedPipelineResult, DatasetCopy, MasterDataset
 from app.services.dataset_registry.storage import master_file_path, write_master_file
-from app.services.dataset_registry import reference_counter
+from app.services.dataset_registry import blob_storage, reference_counter
+from app.routes import datasets as dataset_routes
 
 
 # ── fingerprint.py ────────────────────────────────────────────────────────
@@ -62,6 +63,19 @@ def test_write_master_file_round_trips_content(tmp_path):
     fingerprint = compute_fingerprint(content)
     path = write_master_file(str(tmp_path), fingerprint, ".csv", content)
     assert Path(path).read_bytes() == content
+
+
+def test_blob_delete_treats_already_missing_object_as_success():
+    class ResourceNotFoundError(Exception):
+        pass
+
+    container = MagicMock()
+    container.delete_blob.side_effect = ResourceNotFoundError()
+    with patch(
+        "app.services.dataset_registry.blob_storage._container_client",
+        return_value=container,
+    ):
+        assert blob_storage.delete_master("azure-blob://datasets/aa/file.csv") is True
 
 
 # ── DatasetRegistry.register() ─────────────────────────────────────────────
@@ -200,6 +214,129 @@ def test_delete_master_refuses_without_touching_storage(tmp_path):
     assert reason is not None
     mock_delete.assert_not_called()
     mock_delete_file.assert_not_called()
+
+
+# ── dataset_id deletion ───────────────────────────────────────────────────
+
+def _deletion_audit(*, status="deletion_pending_cleanup", failures=None):
+    now = datetime.now(timezone.utc)
+    dataset_id = str(uuid.uuid4())
+    locations = ["/store/v1.csv", "azure-blob://datasets/aa/v2.csv"]
+    return {
+        "dataset_id": dataset_id,
+        "status": status,
+        "requested_at": now,
+        "completed_at": now if status != "deletion_pending_cleanup" else None,
+        "fingerprints": ["fp-v1", "fp-v2"],
+        "source_locations": locations,
+        "active_copy_count": 3,
+        "cached_result_count": 2,
+        "historical_run_count": 4,
+        "physical_deleted_count": 0,
+        "physical_cleanup_failures": locations if failures is None else failures,
+    }
+
+
+def test_delete_dataset_cleans_all_sources_through_storage_abstraction():
+    audit = _deletion_audit()
+    completed = {
+        **audit,
+        "status": "deleted",
+        "completed_at": datetime.now(timezone.utc),
+        "physical_deleted_count": 2,
+        "physical_cleanup_failures": [],
+    }
+    with patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.begin_dataset_deletion",
+        return_value=(audit, True),
+    ), patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.claim_dataset_cleanup",
+        return_value=("claim-1", audit["source_locations"]),
+    ), patch(
+        "app.services.dataset_registry.reference_counter.storage.delete_master_file",
+        return_value=True,
+    ) as delete_file, patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.finish_dataset_deletion",
+        return_value=completed,
+    ) as finish:
+        result = reference_counter.delete_dataset(audit["dataset_id"])
+
+    assert result["status"] == "deleted"
+    assert result["idempotent"] is False
+    assert [call.args[0] for call in delete_file.call_args_list] == audit["source_locations"]
+    finish.assert_called_once_with(
+        audit["dataset_id"], claim_id="claim-1", failed_locations=[],
+    )
+
+
+def test_delete_dataset_reports_orphan_and_retry_is_idempotent():
+    audit = _deletion_audit(status="deletion_pending_cleanup", failures=["/store/orphan.csv"])
+    updated = {
+        **audit,
+        "status": "deletion_pending_cleanup",
+        "physical_cleanup_failures": ["/store/orphan.csv"],
+    }
+    with patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.begin_dataset_deletion",
+        return_value=(audit, False),
+    ), patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.claim_dataset_cleanup",
+        return_value=("claim-2", ["/store/orphan.csv"]),
+    ), patch(
+        "app.services.dataset_registry.reference_counter.storage.delete_master_file",
+        return_value=False,
+    ) as delete_file, patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.finish_dataset_deletion",
+        return_value=updated,
+    ):
+        result = reference_counter.delete_dataset(audit["dataset_id"])
+
+    assert result["status"] == "deletion_pending_cleanup"
+    assert result["idempotent"] is True
+    assert result["physical_cleanup_failures"] == ["/store/orphan.csv"]
+    delete_file.assert_called_once_with("/store/orphan.csv")
+
+
+def test_delete_dataset_completed_tombstone_does_not_repeat_physical_cleanup():
+    audit = _deletion_audit(status="deleted", failures=[])
+    with patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.begin_dataset_deletion",
+        return_value=(audit, False),
+    ), patch(
+        "app.services.dataset_registry.reference_counter.storage.delete_master_file",
+    ) as delete_file, patch(
+        "app.services.dataset_registry.reference_counter.metadata_cache.finish_dataset_deletion",
+    ) as finish:
+        result = reference_counter.delete_dataset(audit["dataset_id"])
+
+    assert result["status"] == "deleted"
+    assert result["idempotent"] is True
+    delete_file.assert_not_called()
+    finish.assert_not_called()
+
+
+def test_delete_dataset_route_requires_explicit_confirmation():
+    with pytest.raises(Exception) as exc_info:
+        dataset_routes.delete_dataset(str(uuid.uuid4()), confirm=False)
+    assert exc_info.value.status_code == 400
+    assert "confirm=true" in exc_info.value.detail
+
+
+def test_delete_dataset_route_exposes_clear_cleanup_counts():
+    audit = _deletion_audit(status="deletion_pending_cleanup", failures=["blob://orphan"])
+    audit["idempotent"] = True
+    audit["completed_at"] = datetime.now(timezone.utc)
+    with patch(
+        "app.routes.datasets.reference_counter.delete_dataset",
+        return_value=audit,
+    ):
+        response = dataset_routes.delete_dataset(audit["dataset_id"], confirm=True)
+
+    assert response.dataset_id == audit["dataset_id"]
+    assert response.status == "deletion_pending_cleanup"
+    assert response.idempotent is True
+    assert response.orphaned_object_count == 1
+    assert response.historical_run_count == 4
 
 
 # ── resolve_dataset_identity / persist_master_dataset graph nodes ──────────

@@ -78,9 +78,20 @@ class DatasetRegistry:
         graph node) still needs to run the existing Agent 1 -> Agent 2
         chain and then call persist_result() below."""
         fingerprint = self.compute_fingerprint(content)
+        logger.info(
+            "master_dataset_registration_started | filename=%s | fingerprint=%s | bytes=%d",
+            filename,
+            fingerprint,
+            len(content),
+        )
 
         existing = self.detect_duplicate(fingerprint)
         if existing is not None:
+            logger.info(
+                "master_blob_upload_skipped | reason=duplicate_fingerprint | fingerprint=%s | existing_storage_location=%s",
+                fingerprint,
+                existing.storage_location,
+            )
             copy = self._create_copy_and_increment(
                 fingerprint=fingerprint, uploaded_filename=filename, version=existing.latest_version,
                 user_id=user_id,
@@ -101,7 +112,17 @@ class DatasetRegistry:
             dataset_id = str(uuid4())
             previous_fingerprint = None
 
+        logger.info(
+            "master_dataset_physical_write_requested | fingerprint=%s | extension=%s",
+            fingerprint,
+            file_extension,
+        )
         storage_location = storage.write_master_file(self._storage_dir, fingerprint, file_extension, content)
+        logger.info(
+            "master_dataset_physical_write_completed | fingerprint=%s | storage_location=%s",
+            fingerprint,
+            storage_location,
+        )
         now = datetime.now(timezone.utc)
         master = MasterDataset(
             fingerprint=fingerprint, dataset_id=dataset_id, original_filename=filename,
@@ -110,7 +131,14 @@ class DatasetRegistry:
             previous_fingerprint=previous_fingerprint, reference_count=0,
             first_uploaded_at=now, last_referenced_at=now,
         )
-        metadata_cache.insert_master_dataset(master)
+        try:
+            metadata_cache.insert_master_dataset(master)
+        except metadata_cache.DatasetDeletedError:
+            # The source write happens before the metadata transaction. If a
+            # concurrent DELETE won the lineage lock, remove this unregistered
+            # object so the tombstone cannot gain a new orphan.
+            storage.delete_master_file(storage_location)
+            raise
 
         copy = self._create_copy_and_increment(
             fingerprint=fingerprint, uploaded_filename=filename, version=version_number, user_id=user_id,

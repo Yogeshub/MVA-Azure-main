@@ -17,6 +17,7 @@ from app.models.quality_assessment import QualityAssessment
 from app.models.readiness_assessment import ReadinessAssessment
 from app.models.feature_recommendation import FeatureRecommendation
 from app.models.chart_specification import ChartSpecification
+from app.models.drill_down_cube import DrillDownCube
 from app.core.enums import RunStatus
 from app.core.constants import PIPELINE_VERSION
 
@@ -28,14 +29,26 @@ class ProfileRunRepository:
         self._session = session
 
     def create_run(self, run_id: uuid.UUID, primary_domain: str,
-                   filename: str, file_type: str) -> ProfileRun:
-        """Create a new profile run record."""
+                   filename: str, file_type: str,
+                   source_fingerprint: str | None = None,
+                   source_dataset_uri: str | None = None,
+                   source_sheet_name: str | None = None) -> ProfileRun:
+        """Create a new profile run record.
+
+        The three source_* arguments are the durable reference back to the
+        dataset this run was built from. They are optional: a caller that does
+        not supply one still gets a working run, it just cannot recompute a
+        breakdown once the retained working copy has been swept.
+        """
         run = ProfileRun(
             id=run_id,
             status=RunStatus.PENDING.value,
             primary_domain=primary_domain,
             source_filename=filename,
             source_file_type=file_type,
+            source_fingerprint=source_fingerprint,
+            source_dataset_uri=source_dataset_uri,
+            source_sheet_name=source_sheet_name,
             pipeline_version=PIPELINE_VERSION,
         )
         self._session.add(run)
@@ -245,6 +258,39 @@ class ProfileRunRepository:
                 rank=c.get("rank", 1),
             )
             self._session.add(cs)
+
+    def persist_drill_down_cubes(self, run_id: uuid.UUID, cubes: list[dict[str, Any]]) -> None:
+        """Persist the pre-aggregated drill-down cubes built during profiling.
+
+        These were computed on every run but discarded before this, which is why
+        drill-down had no cubes to serve. chart_id stays null: a cube belongs to
+        a hierarchy level and ancestor path, not to one chart.
+        """
+        for c in cubes or []:
+            level_column = c.get("level_column")
+            data = c.get("aggregated_data_json")
+            if not level_column or not data:
+                continue
+            self._session.add(DrillDownCube(
+                run_id=run_id,
+                chart_id=None,
+                level_column=str(level_column)[:500],
+                level_depth=int(c.get("level_depth") or 0),
+                dimension_path_json=c.get("dimension_path_json") or {},
+                aggregated_data_json=data,
+                metric_column=str(c.get("metric_column") or "")[:500],
+                aggregation=str(c.get("aggregation") or "sum")[:20],
+                record_count=int(c.get("record_count") or 0),
+            ))
+
+    def list_drill_down_cubes(self, run_id: uuid.UUID) -> list[DrillDownCube]:
+        """All pre-aggregated cubes for a run, shallowest level first."""
+        stmt = (
+            select(DrillDownCube)
+            .where(DrillDownCube.run_id == run_id)
+            .order_by(DrillDownCube.level_depth)
+        )
+        return list(self._session.execute(stmt).scalars().all())
 
     def get_dataset_profile(self, run_id: uuid.UUID) -> DatasetProfile | None:
         """Get the dataset-level profile for a run."""

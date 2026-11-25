@@ -1,0 +1,15 @@
+# Azure Blob Storage backend for the Master Dataset store.
+#
+# Only needed when MASTER_DATASET_BACKEND=blob — i.e. a deployment where the
+# orchestrator and Agent 2 do not share a filesystem. Local development runs
+# on MASTER_DATASET_BACKEND=local (the default) and does NOT need these:
+# both services import the SDK lazily, inside the blob backend, so its absence
+# costs nothing when the backend is unused.
+#
+# Install alongside the main set:
+#   pip install -r requirements.txt -r requirements-azure.txt
+
+azure-storage-blob>=12.19.0
+# Only required when authenticating with Managed Identity rather than
+# AZURE_BLOB_CONNECTION_STRING. Recommended for production — no secret in config.
+azure-identity>=1.15.0

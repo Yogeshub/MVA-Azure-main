@@ -455,7 +455,13 @@ class AnalyticsGraphNodes:
     def narrate(self, state: AnalyticsState) -> dict:
         evidence_builder = state.get("evidence_builder")
         narration_context = evidence_builder.to_narration_context() if evidence_builder else {}
-        response = self.explanation.narrate(narration_context, state["business_question"])
+        response = self.explanation.narrate(
+            narration_context,
+            state["business_question"],
+            explanation_mode=state.get("explanation_mode"),
+            persona=state.get("persona"),
+            custom_persona=state.get("custom_persona"),
+        )
         # last_engine_used is set as a side effect of the narrate() call
         # above — the only way to observe which path it actually took.
         # Surfaced into state for graph.py's execution trace.

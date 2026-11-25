@@ -17,11 +17,17 @@ class PipelineState(TypedDict, total=False):
     business_question: str | None
     target_column: str | None
     request_rules: str | None
+    explanation_mode: str | None
+    persona: str | None
+    custom_persona: str | None
 
     # ── Dataset Registry (Stage 0A) ────────────────────────────────────────
     file_extension: str
     fingerprint: str | None
     copy_id: str | None
+    # Where the permanent copy of these bytes lives, handed to Agent 2 so a
+    # finished run can find its own rows again after its working copy is swept.
+    master_storage_location: str | None
     was_cached: bool
 
     # ── Agent 1 ─────────────────────────────────────────────────────────────

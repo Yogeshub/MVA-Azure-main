@@ -37,24 +37,38 @@ _MAX_PARALLEL_BATCHES = 5
 
 def _get_llm_client() -> httpx.Client:
     """Create and return a reusable HTTP client for Azure OpenAI chat completions."""
-    return httpx.Client(timeout=30.0)
+    return httpx.Client(timeout=120.0)
+3
 
 
 def _chat_complete(client: httpx.Client, messages: list[dict], temperature: float, max_tokens: int) -> str:
-    response = client.post(
-        f"{settings.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/v1/chat/completions",
-        headers={
-            "api-key": settings.AZURE_OPENAI_API_KEY,
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": settings.AZURE_OPENAI_DEPLOYMENT,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-    )
-    response.raise_for_status()
+    if not settings.AZURE_OPENAI_ENDPOINT or not settings.AZURE_OPENAI_API_KEY or not settings.AZURE_OPENAI_DEPLOYMENT:
+        raise RuntimeError(
+            "AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT "
+            "not configured on this App Service."
+        )
+
+    url = f"{settings.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/v1/chat/completions"
+    headers = {"api-key": settings.AZURE_OPENAI_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "model": settings.AZURE_OPENAI_DEPLOYMENT,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    response = client.post(url, headers=headers, json=payload)
+
+    # Newer models reject max_tokens/temperature — retry once with the new param names
+    if response.status_code == 400 and ("max_tokens" in response.text or "temperature" in response.text):
+        payload.pop("max_tokens", None)
+        payload.pop("temperature", None)
+        payload["max_completion_tokens"] = max_tokens
+        response = client.post(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        # Surface Azure's actual error message instead of a bare status code
+        raise RuntimeError(f"Azure OpenAI {response.status_code}: {response.text[:500]}")
     return response.json()["choices"][0]["message"]["content"]
 
 

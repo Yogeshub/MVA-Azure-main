@@ -21,6 +21,17 @@ class ProfileRun(Base):
     dominant_secondary_domain: Mapped[str | None] = mapped_column(String(100), nullable=True)
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     source_file_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Durable pointer back to the bytes this run was built from. The retained
+    # scratch copy under TEMP_STORAGE_DIR is a cache with a lifetime; this
+    # reference outlives it, so a breakdown the run never pre-aggregated can be
+    # recomputed from the source dataset instead of failing.
+    # Nullable: a caller that supplies no reference behaves exactly as before.
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_dataset_uri: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # The worksheet that was profiled. Also written to the retained run's
+    # sidecar, but that dies with the scratch copy — a multi-sheet workbook
+    # cannot be re-opened correctly without it.
+    source_sheet_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     column_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

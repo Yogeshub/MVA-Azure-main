@@ -4,7 +4,7 @@ import uuid
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -15,13 +15,17 @@ from app.api.auth import get_current_user
 from app.repositories.configuration_repository import ConfigurationRepository
 from app.repositories.profile_run_repository import ProfileRunRepository
 from app.repositories.rule_repository import RuleRepository
+from app.services.ingestion.source_dataset_resolver import (
+    SourceDatasetReference,
+    SourceDatasetResolver,
+)
 from app.services.ingestion.temporary_storage import TemporaryStorage
 from app.services.llm.factory import create_llm_provider
 from app.services.quality.overall_score import calculate_overall_score
 from app.services.schema_intelligence.local_provider import LocalSchemaIntelligenceProvider
 from app.services.orchestration.job_manager import JobManager, ExecutionMode
 from app.agents.data_profiling_agent.graph import run_profiling_graph
-from app.schemas.requests import DrillDownRequest
+from app.schemas.requests import AggregateRequest, DrillDownRequest
 from app.schemas.responses import RunCreatedResponse
 
 logger = get_logger(__name__)
@@ -37,6 +41,10 @@ def _get_graph_dependencies(settings: Settings) -> tuple[ConfigurationRepository
     llm = create_llm_provider(settings)
     si = LocalSchemaIntelligenceProvider(llm)
     temp = TemporaryStorage(settings)
+    # Retained source files are swept here rather than on a schedule, so an
+    # idle service never accumulates uploads it will never be asked about.
+    if getattr(settings, "retain_run_files", False):
+        temp.purge_expired(getattr(settings, "run_file_retention_hours", 24))
     return config_repo, si, temp
 
 
@@ -135,6 +143,19 @@ def _rule_evaluation_to_dict(e) -> dict[str, Any]:
     }
 
 
+def _cube_to_dict(cube) -> dict[str, Any]:
+    """Serialize a persisted drill-down cube in the shape the pipeline produced."""
+    return {
+        "level_column": cube.level_column,
+        "level_depth": cube.level_depth,
+        "dimension_path_json": cube.dimension_path_json or {},
+        "aggregated_data_json": cube.aggregated_data_json or [],
+        "metric_column": cube.metric_column,
+        "aggregation": cube.aggregation,
+        "record_count": cube.record_count,
+    }
+
+
 def _chart_to_dict(cs) -> dict[str, Any]:
     spec = dict(cs.specification_json or {})
     spec.setdefault("chart_key", cs.chart_key)
@@ -155,6 +176,12 @@ async def create_profile_run(
     sheet_name: str | None = Form(default=None),
     business_question: str | None = Form(default=None),
     target_column: str | None = Form(default=None),
+    # Durable reference to where this upload permanently lives, supplied by the
+    # orchestrator's Dataset Registry. Optional — without it the run still
+    # profiles normally, it just cannot recompute an unforeseen breakdown once
+    # the retained working copy has been swept.
+    source_fingerprint: str | None = Form(default=None),
+    source_dataset_uri: str | None = Form(default=None),
     settings: Settings = Depends(get_cached_settings),
     user: str = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -203,6 +230,11 @@ async def create_profile_run(
 
     # Execute pipeline (LangGraph-based) via job manager
     config_repo_dep, si_dep, temp_dep = _get_graph_dependencies(settings)
+    # Record how this upload is being read so a retained run can be re-opened
+    # identically later for ad-hoc aggregation (a multi-sheet workbook is
+    # unreadable without knowing which sheet was profiled).
+    if getattr(settings, "retain_run_files", False):
+        temp_dep.write_run_metadata(run_id, {"sheet_name": sheet_name, "filename": filename})
     _job_manager.create_job(str(run_id))
 
     def _run_pipeline():
@@ -234,7 +266,12 @@ async def create_profile_run(
         result = completed_job.result
 
         repo = ProfileRunRepository(db)
-        repo.create_run(run_id, primary_domain, filename, file_type)
+        repo.create_run(
+            run_id, primary_domain, filename, file_type,
+            source_fingerprint=(source_fingerprint or None),
+            source_dataset_uri=(source_dataset_uri or None),
+            source_sheet_name=sheet_name,
+        )
         repo.mark_processing(run_id)
 
         if result.status == RunStatus.FAILED:
@@ -256,6 +293,7 @@ async def create_profile_run(
         repo.persist_readiness_assessments(run_id, result.readiness_assessments)
         repo.persist_feature_recommendation(run_id, result.feature_recommendation, business_question)
         repo.persist_charts(run_id, result.charts)
+        repo.persist_drill_down_cubes(run_id, getattr(result, "drill_down_cubes", None) or [])
         rule_repo.persist_suggestions(run_id, result.rule_suggestions)
         rule_repo.persist_evaluations(run_id, result.rule_evaluations, rule_definition_ids_by_key)
 
@@ -362,6 +400,7 @@ def get_full_result(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any
         "readiness_assessments": [_readiness_assessment_to_dict(ra) for ra in readiness_assessments],
         "feature_recommendation": _feature_recommendation_to_dict(feature_recommendation) if feature_recommendation else {},
         "charts": [_chart_to_dict(c) for c in charts],
+        "drill_down_cubes": [_cube_to_dict(c) for c in repo.list_drill_down_cubes(run_uuid)],
         "rule_suggestions": [_rule_suggestion_to_dict(s) for s in rule_suggestions],
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
@@ -475,8 +514,271 @@ def drill_down(run_id: str, chart_id: str, body: DrillDownRequest, db: Session =
     hierarchy_levels = (hierarchy or {}).get("level_columns", [])
 
     return service.execute_drill_down(
-        cubes=[],  # Drill-down cubes are not yet persisted (chart_id association not modeled by the orchestrator)
+        cubes=[_cube_to_dict(c) for c in repo.list_drill_down_cubes(run_uuid)],
         chart_id=chart_id,
         hierarchy_levels=hierarchy_levels,
         selected_path=body.selected_path,
     )
+
+
+# The drill path is bounded so one request cannot turn into an unbounded chain
+# of group-bys. Twelve levels is deeper than any hierarchy this pipeline detects
+# and matches the orchestrator's own validation.
+MAX_DRILL_DEPTH = 12
+
+# Cube generation stops storing groups at this many (see the profiling
+# pipeline's cube node). A cube sitting on the cap cannot prove it is complete.
+CUBE_GROUP_CAP = 100
+
+
+def _cube_matches(cube, dimension: str, metric: str | None, aggregation: str,
+                  filters: list[dict[str, str]]) -> bool:
+    """A cube may only answer a query it matches exactly.
+
+    Dimension, metric, aggregation and the full ancestor path must all agree.
+    A near-match would show real numbers under the wrong label, which is worse
+    than returning nothing.
+    """
+    if cube.level_column != dimension:
+        return False
+    if (cube.metric_column or None) != (metric or None):
+        return False
+    if (cube.aggregation or "").lower() != aggregation:
+        return False
+    columns = [f["column"] for f in filters]
+    if len(columns) != len(set(columns)):
+        # A column pinned twice is applied sequentially over the rows, so
+        # "A = x" then "A = y" matches nothing. A cube's dimension_path is a
+        # mapping, so the same pair collapses to one entry and would match a
+        # cube built for "A = y" alone — answering a different, non-empty
+        # question and labelling it complete. Recompute instead; the row path
+        # gets the contradiction right.
+        return False
+    path = {str(k): str(v) for k, v in (cube.dimension_path_json or {}).items()}
+    requested = {f["column"]: str(f["value"]) for f in filters}
+    return path == requested
+
+
+def _cube_points(cube) -> tuple[list[dict[str, Any]], int]:
+    """The cube's groups, and how many rows back them."""
+    data = [
+        {"label": str(row.get("label")), "value": row.get("value"), "count": row.get("count")}
+        for row in (cube.aggregated_data_json or [])
+        if isinstance(row, dict) and row.get("label") is not None
+    ]
+    contributing = 0
+    for row in data:
+        try:
+            contributing += int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+    return data, contributing
+
+
+def _cube_is_complete(cube) -> bool:
+    """True only when the cube provably kept every row in its scope.
+
+    Cube generation drops groups below MIN_CUBE_GROUP_SIZE, drops groups with no
+    numeric value, and stops at CUBE_GROUP_CAP groups. None of that is recorded
+    on the cube — but the per-group counts and the cube's own record_count are,
+    and when they agree nothing was dropped. Anything else is treated as partial
+    and recomputed from the source dataset instead, so a cube is only ever used
+    as a free shortcut to the same answer, never as a cheaper different one.
+    """
+    data, contributing = _cube_points(cube)
+    if not data or len(data) >= CUBE_GROUP_CAP:
+        return False
+    record_count = getattr(cube, "record_count", None)
+    if not isinstance(record_count, int) or record_count <= 0:
+        return False
+    return contributing == record_count
+
+
+def _cube_response(cube, filters: list[dict[str, str]], *, complete: bool) -> dict[str, Any]:
+    """Serve a breakdown from a pre-aggregated cube, stating its coverage."""
+    data, contributing = _cube_points(cube)
+    title = (
+        f"{(cube.aggregation or 'sum').capitalize()} of {cube.metric_column} by {cube.level_column}"
+    )
+    if complete:
+        description = (
+            f"Pre-aggregated during profiling from all {cube.record_count:,} rows in scope. "
+            "Every row in scope is accounted for in the groups shown, so this is the same "
+            "answer recomputing from the source rows would give."
+        )
+    else:
+        description = (
+            f"Pre-aggregated during profiling from {cube.record_count:,} rows in scope; "
+            f"{contributing:,} rows back the groups shown. Groups below the configured minimum "
+            f"size were dropped then, and at most {CUBE_GROUP_CAP} were kept, so this view may "
+            "not be exhaustive. The source dataset for this run could not be read back, so it "
+            "could not be recomputed exactly."
+        )
+    return {
+        "dimension": cube.level_column,
+        "metric": cube.metric_column,
+        "aggregation": cube.aggregation,
+        "filters": filters,
+        "data": data,
+        "rows_used": contributing,
+        # A partial cube cannot say how many rows the filters matched. A complete
+        # one can: its scope is exactly this filter path. Neither knows how large
+        # the whole dataset was, so rows_total stays unknown either way.
+        "rows_matched": cube.record_count if complete else None,
+        "rows_total": None,
+        "rows_in_cube_scope": cube.record_count,
+        "group_count": len(data),
+        "returned_group_count": len(data),
+        "truncated": False,
+        "coverage": "complete" if complete else "partial",
+        "source": "cube",
+        "title": title,
+        "description": description,
+    }
+
+
+def _source_reference_for(run, hint) -> SourceDatasetReference:
+    """The run's own dataset reference, with caller-supplied blanks filled in.
+
+    What the run recorded always wins. A hint can only supply something the run
+    does not know — which is how a run created before references were persisted
+    becomes answerable again — never redirect a run at different data.
+    """
+    recorded = SourceDatasetReference(
+        fingerprint=getattr(run, "source_fingerprint", None) or None,
+        uri=getattr(run, "source_dataset_uri", None) or None,
+        filename=getattr(run, "source_filename", None) or None,
+        sheet_name=getattr(run, "source_sheet_name", None) or None,
+    )
+    if hint is None:
+        return recorded
+    return recorded.merged_with(
+        SourceDatasetReference(
+            fingerprint=(hint.fingerprint or None),
+            uri=(hint.uri or None),
+            filename=(hint.filename or None),
+            sheet_name=(hint.sheet_name or None),
+        )
+    )
+
+
+def _unresolvable_detail(run) -> str:
+    """Say which of the two failures this is, because the fixes differ."""
+    if getattr(run, "source_fingerprint", None) or getattr(run, "source_dataset_uri", None):
+        return (
+            "This run references a stored source dataset, but it could not be read back, and "
+            "no pre-aggregated cube matches this breakdown — so it cannot be computed. Check "
+            "that this service can reach the master dataset store (MASTER_DATASET_STORAGE_DIR "
+            "or MASTER_DATASET_CONTENT_URL)."
+        )
+    return (
+        "This run recorded no reference to its source dataset, its retained working copy is "
+        "gone, and no pre-aggregated cube matches this breakdown — so it cannot be computed. "
+        "Runs profiled before source references were recorded can only answer the breakdowns "
+        "their cubes already cover; re-run the analysis on this dataset to make every "
+        "breakdown available."
+    )
+
+
+@router.post("/{run_id}/aggregate")
+def aggregate_run(
+    run_id: str,
+    body: AggregateRequest,
+    settings: Settings = Depends(get_cached_settings),
+    db: Session = Depends(get_db),
+    user: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Group a completed run's rows by any dimension and measure any metric.
+
+    Source precedence, cheapest exact answer first:
+      1. a pre-aggregated cube matching this breakdown exactly that can prove it
+         kept every row in scope — free, and identical to recomputing;
+      2. the run's source dataset — the working copy retained from the run if it
+         is still there, otherwise the permanent copy the run references. Exact,
+         at any drill depth, for any dimension x metric pairing;
+      3. an exactly-matching cube that cannot prove completeness, labelled
+         partial;
+      4. nothing — a 409 naming which reference failed, so the caller tells the
+         analyst the truth instead of rendering a fabricated breakdown.
+
+    Retention (RETAIN_RUN_FILES / RUN_FILE_RETENTION_HOURS) only decides whether
+    step 2 needs to go back to the permanent copy. It no longer decides whether
+    a breakdown can be answered at all.
+    """
+    from app.services.charts.aggregation_service import (
+        AggregationRequestError,
+        AggregationService,
+        load_run_dataframe,
+    )
+
+    repo = ProfileRunRepository(db)
+    run_uuid = _parse_run_id(run_id)
+    run = repo.get_run(run_uuid)
+    if not run:
+        from app.core.exceptions import RunNotFoundError
+        raise RunNotFoundError(run_id)
+
+    if len(body.filters) > MAX_DRILL_DEPTH:
+        raise HTTPException(
+            status_code=400, detail=f"The drill path is limited to {MAX_DRILL_DEPTH} levels."
+        )
+
+    dimension = body.dimension.strip()
+    metric = (body.metric or "").strip() or None
+    aggregation = (body.aggregation or "sum").strip().lower()
+    filters = [{"column": f.column.strip(), "value": f.value} for f in body.filters if f.column.strip()]
+
+    if not dimension:
+        raise HTTPException(status_code=400, detail="A dimension column is required.")
+
+    matching_cube = next(
+        (
+            cube
+            for cube in repo.list_drill_down_cubes(run_uuid)
+            if _cube_matches(cube, dimension, metric, aggregation, filters)
+        ),
+        None,
+    )
+    if matching_cube is not None and _cube_is_complete(matching_cube):
+        return _cube_response(matching_cube, filters, complete=True)
+
+    service = AggregationService(max_groups=getattr(settings, "max_aggregation_groups", 200))
+    resolver = SourceDatasetResolver(settings, TemporaryStorage(settings))
+    resolved = resolver.resolve(run_uuid, _source_reference_for(run, body.source_reference))
+
+    if resolved is not None:
+        try:
+            df = load_run_dataframe(settings, resolved.path, sheet_name=resolved.sheet_name)
+        except Exception as e:  # noqa: BLE001 — fall back to cubes, but say why in the log
+            logger.warning(
+                "aggregate_source_reload_failed",
+                run_id=run_id,
+                origin=resolved.origin,
+                error=str(e),
+            )
+        else:
+            recomputed = not resolved.is_retained_run_file
+            try:
+                return service.aggregate(
+                    df,
+                    dimension,
+                    metric,
+                    aggregation,
+                    filters,
+                    source="source_dataset" if recomputed else "dataset",
+                    source_note=(
+                        "Recomputed from the stored source dataset for this run — the working "
+                        "copy kept during profiling had already been swept."
+                        if recomputed
+                        else None
+                    ),
+                    include_next_levels=body.include_next_levels,
+                    max_next_levels=getattr(settings, "max_next_level_candidates", 40),
+                )
+            except AggregationRequestError as e:
+                raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    if matching_cube is not None:
+        return _cube_response(matching_cube, filters, complete=False)
+
+    raise HTTPException(status_code=409, detail=_unresolvable_detail(run))

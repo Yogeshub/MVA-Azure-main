@@ -447,6 +447,9 @@ def run_analytics_graph(
     charts: list[dict] | None = None,
     full_feature_recommendation: dict | None = None,
     detected_domain: str | None = None,
+    explanation_mode: str | None = None,
+    persona: str | None = None,
+    custom_persona: str | None = None,
 ) -> dict[str, Any]:
     """
     Write the uploaded dataset to a temp CSV, build+invoke the graph against
@@ -503,6 +506,9 @@ def run_analytics_graph(
             "feature_recommendation": feature_recommendation,
             "ml_readiness_breakdown": ml_readiness_breakdown,
             "llm_readiness_breakdown": llm_readiness_breakdown,
+            "explanation_mode": explanation_mode,
+            "persona": persona,
+            "custom_persona": custom_persona,
         }
 
         # graph.stream(..., stream_mode="updates") yields one {node_name:

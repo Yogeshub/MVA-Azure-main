@@ -19,6 +19,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 import psycopg2
 import psycopg2.extras
@@ -29,6 +30,41 @@ from app.services.dataset_registry.models import CachedPipelineResult, DatasetCo
 logger = logging.getLogger(__name__)
 
 RESPONSE_SCHEMA_VERSION = 1
+
+
+class DatasetDeletedError(RuntimeError):
+    """Raised when a write targets a lineage that has a durable tombstone."""
+
+
+def _lock_dataset(cur, dataset_id: str) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"dataset:{dataset_id}",))
+
+
+def _lock_fingerprint(cur, fingerprint: str) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"fingerprint:{fingerprint}",),
+    )
+
+
+def _raise_if_dataset_deleted(cur, dataset_id: str) -> None:
+    cur.execute(
+        "SELECT 1 FROM dataset_deletion_audits WHERE dataset_id = %s",
+        (dataset_id,),
+    )
+    if cur.fetchone() is not None:
+        raise DatasetDeletedError(f"Dataset '{dataset_id}' has been permanently deleted.")
+
+
+def _raise_if_fingerprint_deleted(cur, fingerprint: str) -> None:
+    cur.execute(
+        "SELECT 1 FROM dataset_deletion_audits WHERE fingerprints @> %s::jsonb",
+        (json.dumps([fingerprint]),),
+    )
+    if cur.fetchone() is not None:
+        raise DatasetDeletedError(
+            f"Fingerprint '{fingerprint}' belongs to a permanently deleted dataset."
+        )
 
 CREATE_MASTER_DATASETS_SQL = """
 CREATE TABLE IF NOT EXISTS master_datasets (
@@ -73,6 +109,29 @@ CREATE_DATASET_COPIES_ACTIVE_IDX_SQL = (
     "WHERE deleted_flag = FALSE;"
 )
 
+# A profiling run is answerable for as long as its rows are reachable. Agent 2
+# keeps a working copy only for RUN_FILE_RETENTION_HOURS, but the Master Dataset
+# it came from is stored here permanently and never purged — what was missing
+# was the link between the two. This table is that link, written the moment a
+# run_id exists (and on a cache hit, for the run the cached result belongs to),
+# so any run can be pointed back at its own bytes long after the working copy
+# has been swept. ON DELETE CASCADE: if the master is deleted the link is a lie,
+# and a lie is worse than a missing row.
+CREATE_RUN_DATASET_LINKS_SQL = """
+CREATE TABLE IF NOT EXISTS run_dataset_links (
+    run_id            TEXT PRIMARY KEY,
+    fingerprint       TEXT NOT NULL REFERENCES master_datasets(fingerprint) ON DELETE CASCADE,
+    copy_id           UUID,
+    storage_location  TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    sheet_name        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+CREATE_RUN_DATASET_LINKS_FP_IDX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_run_dataset_links_fingerprint ON run_dataset_links(fingerprint);"
+)
+
 CREATE_MASTER_DATASET_RESULTS_SQL = """
 CREATE TABLE IF NOT EXISTS master_dataset_results (
     fingerprint             TEXT PRIMARY KEY REFERENCES master_datasets(fingerprint) ON DELETE CASCADE,
@@ -82,6 +141,62 @@ CREATE TABLE IF NOT EXISTS master_dataset_results (
     response_schema_version INTEGER NOT NULL DEFAULT 1,
     cached_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+"""
+
+# Dataset deletion is keyed by the stable dataset_id (and therefore covers all
+# versions/fingerprints in that lineage).  This row intentionally outlives the
+# master rows: it is both the tombstone that makes DELETE idempotent and the
+# durable audit record for logical and physical cleanup.
+CREATE_DATASET_DELETION_AUDITS_SQL = """
+CREATE TABLE IF NOT EXISTS dataset_deletion_audits (
+    dataset_id                UUID PRIMARY KEY,
+    status                    TEXT NOT NULL,
+    requested_by              TEXT NOT NULL DEFAULT 'unknown',
+    requested_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at              TIMESTAMPTZ,
+    fingerprints              JSONB NOT NULL,
+    source_locations          JSONB NOT NULL,
+    active_copy_count         INTEGER NOT NULL DEFAULT 0,
+    cached_result_count       INTEGER NOT NULL DEFAULT 0,
+    historical_run_count      INTEGER NOT NULL DEFAULT 0,
+    physical_deleted_count    INTEGER NOT NULL DEFAULT 0,
+    physical_cleanup_failures JSONB NOT NULL DEFAULT '[]'::jsonb,
+    cleanup_claim_id          TEXT,
+    cleanup_claimed_at        TIMESTAMPTZ
+);
+"""
+MIGRATE_DATASET_DELETION_AUDITS_SQL = """
+ALTER TABLE dataset_deletion_audits
+ADD COLUMN IF NOT EXISTS requested_by TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE dataset_deletion_audits
+ADD COLUMN IF NOT EXISTS cleanup_claim_id TEXT;
+ALTER TABLE dataset_deletion_audits
+ADD COLUMN IF NOT EXISTS cleanup_claimed_at TIMESTAMPTZ;
+"""
+
+# Older installations created run_dataset_links with an ON DELETE CASCADE
+# foreign key.  Historical execution linkage is audit data and must survive
+# source deletion, so migrate that table in place and allow its source locator
+# to be redacted.  The run_id/fingerprint/filename/sheet linkage remains.
+MIGRATE_RUN_DATASET_LINKS_FOR_DELETION_SQL = """
+ALTER TABLE run_dataset_links ALTER COLUMN storage_location DROP NOT NULL;
+DO $$
+DECLARE constraint_name TEXT;
+BEGIN
+    SELECT tc.constraint_name INTO constraint_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.constraint_column_usage ccu
+        ON tc.constraint_name = ccu.constraint_name
+       AND tc.constraint_schema = ccu.constraint_schema
+     WHERE tc.table_schema = 'orchestrator'
+       AND tc.table_name = 'run_dataset_links'
+       AND tc.constraint_type = 'FOREIGN KEY'
+       AND ccu.table_name = 'master_datasets'
+     LIMIT 1;
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE run_dataset_links DROP CONSTRAINT %I', constraint_name);
+    END IF;
+END $$;
 """
 
 
@@ -118,6 +233,11 @@ def init_db() -> None:
         cur.execute(CREATE_DATASET_COPIES_FP_IDX_SQL)
         cur.execute(CREATE_DATASET_COPIES_ACTIVE_IDX_SQL)
         cur.execute(CREATE_MASTER_DATASET_RESULTS_SQL)
+        cur.execute(CREATE_RUN_DATASET_LINKS_SQL)
+        cur.execute(CREATE_RUN_DATASET_LINKS_FP_IDX_SQL)
+        cur.execute(MIGRATE_RUN_DATASET_LINKS_FOR_DELETION_SQL)
+        cur.execute(CREATE_DATASET_DELETION_AUDITS_SQL)
+        cur.execute(MIGRATE_DATASET_DELETION_AUDITS_SQL)
         conn.commit()
         cur.close()
         conn.close()
@@ -209,6 +329,9 @@ def insert_master_dataset(master: MasterDataset) -> None:
     conn = _get_connection()
     try:
         cur = conn.cursor()
+        _lock_dataset(cur, master.dataset_id)
+        _lock_fingerprint(cur, master.fingerprint)
+        _raise_if_dataset_deleted(cur, master.dataset_id)
         cur.execute(
             """
             INSERT INTO master_datasets (
@@ -290,6 +413,8 @@ def upsert_result(fingerprint: str, primary_domain: str, agent1_body: dict[str, 
     conn = _get_connection()
     try:
         cur = conn.cursor()
+        _lock_fingerprint(cur, fingerprint)
+        _raise_if_fingerprint_deleted(cur, fingerprint)
         cur.execute(
             """
             INSERT INTO master_dataset_results (
@@ -311,10 +436,84 @@ def upsert_result(fingerprint: str, primary_domain: str, agent1_body: dict[str, 
         conn.close()
 
 
+def upsert_run_dataset_link(*, run_id: str, fingerprint: str, copy_id: str | None,
+                            storage_location: str, original_filename: str,
+                            sheet_name: str | None = None,
+                            preserve_existing: bool = False) -> None:
+    """Record which stored dataset a profiling run was built from.
+
+    Upsert rather than insert: a force_revalidate re-run of the same content
+    must refresh the link instead of colliding with it. Raises on DB error —
+    callers treat a failed link as non-fatal (the run still completes, it just
+    cannot be repaired later), matching this module's degrade-to-miss contract.
+
+    ``preserve_existing`` is for the cache-hit path, where the run being linked
+    is an *older* one being replayed. The bytes are identical by construction,
+    but the current request may have selected a different worksheet, and
+    overwriting the stored ``sheet_name`` would later recompute that older run
+    from the wrong sheet. An existing link is already correct for the run it
+    describes, so it is left alone.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        _lock_fingerprint(cur, fingerprint)
+        _raise_if_fingerprint_deleted(cur, fingerprint)
+        cur.execute(
+            """
+            INSERT INTO run_dataset_links (
+                run_id, fingerprint, copy_id, storage_location, original_filename, sheet_name
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            + (
+                "ON CONFLICT (run_id) DO NOTHING"
+                if preserve_existing
+                else """ON CONFLICT (run_id) DO UPDATE SET
+                fingerprint = EXCLUDED.fingerprint,
+                copy_id = EXCLUDED.copy_id,
+                storage_location = EXCLUDED.storage_location,
+                original_filename = EXCLUDED.original_filename,
+                sheet_name = EXCLUDED.sheet_name,
+                created_at = now()"""
+            ),
+            (run_id, fingerprint, copy_id, storage_location, original_filename, sheet_name),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def lookup_run_dataset_link(run_id: str) -> dict[str, Any] | None:
+    """The stored dataset a run was built from, or None if it was never linked."""
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM run_dataset_links WHERE run_id = %s", (run_id,))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
 def insert_copy(copy: DatasetCopy) -> None:
     conn = _get_connection()
     try:
         cur = conn.cursor()
+        cur.execute(
+            "SELECT dataset_id FROM master_datasets WHERE fingerprint = %s",
+            (copy.fingerprint,),
+        )
+        master = cur.fetchone()
+        if master is None:
+            raise DatasetDeletedError(
+                f"Fingerprint '{copy.fingerprint}' is no longer available."
+            )
+        dataset_id = str(master["dataset_id"])
+        _lock_dataset(cur, dataset_id)
+        _lock_fingerprint(cur, copy.fingerprint)
+        _raise_if_dataset_deleted(cur, dataset_id)
         cur.execute(
             """
             INSERT INTO dataset_copies (copy_id, fingerprint, user_id, uploaded_filename, version, deleted_flag)
@@ -342,6 +541,19 @@ def insert_copy_and_increment_reference(copy: DatasetCopy) -> None:
     conn = _get_connection()
     try:
         cur = conn.cursor()
+        cur.execute(
+            "SELECT dataset_id FROM master_datasets WHERE fingerprint = %s",
+            (copy.fingerprint,),
+        )
+        master = cur.fetchone()
+        if master is None:
+            raise DatasetDeletedError(
+                f"Fingerprint '{copy.fingerprint}' is no longer available."
+            )
+        dataset_id = str(master["dataset_id"])
+        _lock_dataset(cur, dataset_id)
+        _lock_fingerprint(cur, copy.fingerprint)
+        _raise_if_dataset_deleted(cur, dataset_id)
         cur.execute(
             """
             INSERT INTO dataset_copies (copy_id, fingerprint, user_id, uploaded_filename, version, deleted_flag)
@@ -414,6 +626,200 @@ def get_master_dataset_row(fingerprint: str) -> dict[str, Any] | None:
         conn.close()
 
 
+def begin_dataset_deletion(
+    dataset_id: str,
+    *,
+    requested_by: str = "unknown",
+) -> tuple[dict[str, Any] | None, bool]:
+    """Atomically tombstone a dataset lineage and remove its live metadata.
+
+    Returns ``(audit, created)``.  A repeated call returns the durable existing
+    audit and never recreates or re-deletes metadata.  Cached results and copy
+    rows are removed by the master FK cascades; run links are retained but
+    their source locator is redacted so historical runs/traces stay linked
+    without retaining a route to source bytes.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        _lock_dataset(cur, dataset_id)
+        cur.execute(
+            "SELECT * FROM dataset_deletion_audits WHERE dataset_id = %s FOR UPDATE",
+            (dataset_id,),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            conn.commit()
+            cur.close()
+            return dict(existing), False
+
+        cur.execute(
+            "SELECT fingerprint, storage_location FROM master_datasets "
+            "WHERE dataset_id = %s FOR UPDATE",
+            (dataset_id,),
+        )
+        masters = cur.fetchall()
+        if not masters:
+            conn.rollback()
+            cur.close()
+            return None, False
+
+        fingerprints = [row["fingerprint"] for row in masters]
+        locations = [row["storage_location"] for row in masters]
+        for fingerprint in sorted(fingerprints):
+            _lock_fingerprint(cur, fingerprint)
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM dataset_copies "
+            "WHERE fingerprint = ANY(%s) AND deleted_flag = FALSE",
+            (fingerprints,),
+        )
+        active_copies = int(cur.fetchone()["n"])
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM master_dataset_results WHERE fingerprint = ANY(%s)",
+            (fingerprints,),
+        )
+        cached_results = int(cur.fetchone()["n"])
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM run_dataset_links WHERE fingerprint = ANY(%s)",
+            (fingerprints,),
+        )
+        historical_runs = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            INSERT INTO dataset_deletion_audits (
+                dataset_id, status, requested_by, fingerprints, source_locations,
+                active_copy_count, cached_result_count, historical_run_count,
+                physical_cleanup_failures
+            ) VALUES (%s, 'deletion_pending_cleanup', %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (
+                dataset_id, requested_by, json.dumps(fingerprints), json.dumps(locations),
+                active_copies, cached_results, historical_runs, json.dumps(locations),
+            ),
+        )
+        audit = dict(cur.fetchone())
+        cur.execute(
+            "UPDATE run_dataset_links SET storage_location = NULL "
+            "WHERE fingerprint = ANY(%s)",
+            (fingerprints,),
+        )
+        cur.execute("DELETE FROM master_datasets WHERE dataset_id = %s", (dataset_id,))
+        conn.commit()
+        cur.close()
+        return audit, True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def claim_dataset_cleanup(
+    dataset_id: str,
+) -> tuple[str, list[str]] | None:
+    """Atomically claim one physical-cleanup attempt for this tombstone.
+
+    A claim expires after five minutes so a crashed process cannot strand
+    cleanup forever. Concurrent DELETE requests return the pending audit
+    instead of both counting or overwriting the same cleanup attempt.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        _lock_dataset(cur, dataset_id)
+        cur.execute(
+            """
+            SELECT *
+              FROM dataset_deletion_audits
+             WHERE dataset_id = %s
+             FOR UPDATE
+            """,
+            (dataset_id,),
+        )
+        row = cur.fetchone()
+        if row is None or row["status"] == "deleted":
+            conn.commit()
+            cur.close()
+            return None
+        if (
+            row.get("cleanup_claim_id")
+            and row.get("cleanup_claimed_at")
+            and (datetime.now(row["cleanup_claimed_at"].tzinfo) - row["cleanup_claimed_at"]).total_seconds() < 300
+        ):
+            conn.commit()
+            cur.close()
+            return None
+
+        claim_id = str(uuid4())
+        locations = list(row["physical_cleanup_failures"] or [])
+        cur.execute(
+            """
+            UPDATE dataset_deletion_audits
+               SET cleanup_claim_id = %s,
+                   cleanup_claimed_at = now()
+             WHERE dataset_id = %s
+            """,
+            (claim_id, dataset_id),
+        )
+        conn.commit()
+        cur.close()
+        return claim_id, locations
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finish_dataset_deletion(
+    dataset_id: str,
+    *,
+    claim_id: str,
+    failed_locations: list[str],
+) -> dict[str, Any]:
+    """Persist physical cleanup outcome and return the updated audit."""
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        status = "deletion_pending_cleanup" if failed_locations else "deleted"
+        cur.execute(
+            """
+            UPDATE dataset_deletion_audits
+               SET status = %s,
+                    completed_at = CASE WHEN %s THEN NULL ELSE now() END,
+                    physical_deleted_count =
+                        jsonb_array_length(source_locations) - %s,
+                    physical_cleanup_failures = %s,
+                    cleanup_claim_id = NULL,
+                    cleanup_claimed_at = NULL
+             WHERE dataset_id = %s
+               AND cleanup_claim_id = %s
+             RETURNING *
+            """,
+            (
+                status,
+                bool(failed_locations),
+                len(failed_locations),
+                json.dumps(failed_locations),
+                dataset_id,
+                claim_id,
+            ),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        if row is None:
+            raise RuntimeError(f"Deletion audit for dataset '{dataset_id}' disappeared.")
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def delete_master_dataset(fingerprint: str) -> None:
     """Hard delete — cascades to dataset_copies and master_dataset_results
     via ON DELETE CASCADE. Callers (reference_counter.can_delete) are
@@ -422,6 +828,13 @@ def delete_master_dataset(fingerprint: str) -> None:
     conn = _get_connection()
     try:
         cur = conn.cursor()
+        # Preserve historical run linkage while making the deleted source
+        # unavailable.  This also keeps the legacy fingerprint API compatible
+        # after the FK-removal migration above.
+        cur.execute(
+            "UPDATE run_dataset_links SET storage_location = NULL WHERE fingerprint = %s",
+            (fingerprint,),
+        )
         cur.execute("DELETE FROM master_datasets WHERE fingerprint = %s", (fingerprint,))
         conn.commit()
         cur.close()

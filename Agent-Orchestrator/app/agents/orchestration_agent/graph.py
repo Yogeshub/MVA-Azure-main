@@ -109,6 +109,9 @@ async def run_orchestrator_pipeline(
     business_question: str | None = None,
     target_column: str | None = None,
     request_rules: str | None = None,
+    explanation_mode: str | None = None,
+    persona: str | None = None,
+    custom_persona: str | None = None,
 ) -> dict[str, Any] | JSONResponse:
     """Execute the orchestrator graph. Returns the success dict
     ({"agent1", "agent2", "agent3", "primary_domain_used"}) on completion —
@@ -138,6 +141,9 @@ async def run_orchestrator_pipeline(
         "business_question": business_question,
         "target_column": target_column,
         "request_rules": request_rules,
+        "explanation_mode": explanation_mode,
+        "persona": persona,
+        "custom_persona": custom_persona,
     }
 
     final_state = await _graph.ainvoke(initial_state, config={"recursion_limit": 25})

@@ -206,4 +206,15 @@ def run_profiling_graph(
         result.error = {"code": getattr(e, "code", "PROCESSING_ERROR"), "message": str(e)}
         return result
     finally:
-        temp_storage.cleanup_run(run_id)
+        # The uploaded rows are the only source that can answer an ad-hoc
+        # aggregation (POST /profile-runs/{run_id}/aggregate) once the run has
+        # finished, so they are retained for a bounded window when that feature
+        # is enabled. Expired runs are swept when the next run starts.
+        if getattr(settings, "retain_run_files", False):
+            logger.info(
+                "run_file_retained",
+                run_id=str(run_id),
+                retention_hours=getattr(settings, "run_file_retention_hours", 0),
+            )
+        else:
+            temp_storage.cleanup_run(run_id)

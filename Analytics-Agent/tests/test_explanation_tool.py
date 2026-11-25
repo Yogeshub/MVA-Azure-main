@@ -11,6 +11,7 @@ a query "HIGH" confidence when only actuals + variance were present (no
 root-cause evidence), contradicting agent.yaml's own confidence_rules.
 """
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -183,3 +184,70 @@ def test_no_azure_openai_client_goes_straight_to_template_formatter():
 
     assert tool.last_engine_used == "Template Formatter"
     assert response
+
+
+# ── Explanation modes/personas are narration-only ───────────────────────────
+
+def test_preferences_change_prompt_but_not_analytical_evidence_payload():
+    evidence = {
+        "actual": 1250.0,
+        "variance_amount": -50.0,
+        "calculation": "actual - budget",
+        "reasons": ["Computed from the filtered dataset"],
+    }
+
+    def captured_request(**preferences):
+        tool = ExplanationTool(llm_readiness_score=99.0)
+        tool._client = MagicMock()
+        response = MagicMock()
+        response.json.return_value = {
+            "choices": [{"message": {"content": "## Summary\nResult.\n## Confidence\nignored"}}],
+        }
+        tool._client.post.return_value = response
+        tool.narrate(evidence, "Why did it change?", **preferences)
+        return tool._client.post.call_args.kwargs["json"]["messages"][1]["content"]
+
+    standard_prompt = captured_request()
+    styled_prompt = captured_request(
+        explanation_mode="Executive", persona="CFO",
+    )
+
+    marker = "Analytical Evidence (pre-computed — narrate only this):\n"
+    standard_json = standard_prompt.split(marker, 1)[1].split("\n\nGenerate", 1)[0]
+    styled_json = styled_prompt.split(marker, 1)[1].split("\nNarration preferences", 1)[0]
+    assert json.loads(standard_json) == json.loads(styled_json)
+    assert evidence == {
+        "actual": 1250.0,
+        "variance_amount": -50.0,
+        "calculation": "actual - budget",
+        "reasons": ["Computed from the filtered dataset"],
+    }
+    assert "Explanation mode (Executive)" in styled_prompt
+    assert "Audience/persona (CFO)" in styled_prompt
+    assert "Narration preferences" not in standard_prompt
+
+
+def test_step_by_step_template_uses_existing_numbers_and_disclaims_hidden_reasoning():
+    evidence = {"actual": 1234.5, "variance_amount": -25.0, "method": "sum"}
+    tool = ExplanationTool(llm_readiness_score=0.0)
+
+    response = tool.narrate(
+        evidence, "Explain the result", explanation_mode="Step by Step",
+        persona="Auditor",
+    )
+
+    assert "Step-by-Step Evidence Walkthrough" in response
+    assert "does not expose or invent hidden chain-of-thought" in response
+    assert "1,234.50" in response
+    assert "-25.00" in response
+    assert evidence == {"actual": 1234.5, "variance_amount": -25.0, "method": "sum"}
+
+
+def test_omitted_preferences_preserve_template_output_byte_for_byte():
+    evidence = {"actual": 10.0, "variance_amount": 2.0}
+    tool = ExplanationTool(llm_readiness_score=0.0)
+    baseline = tool.narrate(evidence, "q")
+    explicit_defaults = tool.narrate(
+        evidence, "q", explanation_mode=None, persona=None, custom_persona=None,
+    )
+    assert explicit_defaults == baseline

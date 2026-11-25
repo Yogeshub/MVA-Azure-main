@@ -15,3 +15,24 @@ shap>=0.44.0
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
+
+uvicorn
+fastapi
+psycopg2
+pydantic
+pydantic-settings
+pandas>=2.2.0,<3.0.0
+numpy
+sqlalchemy
+alembic
+psycopg2-binary
+python-multipart
+pyyaml
+openpyxl
+chardet
+httpx
+structlog
+python-dotenv
+langgraph
+langchain-openai
+langchain-core

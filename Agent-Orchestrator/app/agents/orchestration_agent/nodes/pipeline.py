@@ -23,6 +23,7 @@ import pandas as pd
 
 from app.config import settings
 from app.agents.orchestration_agent.state import PipelineState
+from app.services.dataset_registry import metadata_cache
 from app.services.dataset_registry.dataset_registry import DatasetRegistry
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,9 @@ async def _analyze_via_agent3(
     charts: list | None = None,
     full_feature_recommendation: dict | None = None,
     detected_domain: str | None = None,
+    explanation_mode: str | None = None,
+    persona: str | None = None,
+    custom_persona: str | None = None,
 ) -> dict[str, Any]:
     """The actual call to Agent 3's POST /analyze. Shared by the full
     pipeline's call_agent3 node and the /pipeline/ask route — same request
@@ -328,6 +332,12 @@ async def _analyze_via_agent3(
         data["full_feature_recommendation"] = json.dumps(full_feature_recommendation)
     if detected_domain:
         data["detected_domain"] = detected_domain
+    if explanation_mode:
+        data["explanation_mode"] = explanation_mode
+    if persona:
+        data["persona"] = persona
+    if custom_persona:
+        data["custom_persona"] = custom_persona
 
     try:
         async with httpx.AsyncClient() as client:
@@ -417,17 +427,45 @@ class OrchestratorGraphNodes:
         except Exception as e:
             # Non-fatal degrade: Postgres/storage unavailable -> cache
             # always misses, pipeline runs exactly as it did before this
-            # feature existed.
-            logger.warning(f"Dataset Registry unavailable — running without cache: {e}")
-            return {"file_extension": file_extension, "fingerprint": None, "copy_id": None, "was_cached": False}
+            # feature existed. Keep this behavior, but include a traceback and
+            # effective backend so a failed Blob upload is not mistaken for a
+            # successful local write.
+            logger.exception(
+                "dataset_registry_registration_failed | backend=%s | filename=%s | pipeline_continues_uncached | error=%s",
+                settings.MASTER_DATASET_BACKEND,
+                state["filename"],
+                e,
+            )
+            return {
+                "file_extension": file_extension, "fingerprint": None, "copy_id": None,
+                "master_storage_location": None, "was_cached": False,
+            }
 
         force = bool(state.get("force_revalidate") or state.get("force_reclassify"))
 
         if result.was_duplicate and result.cached_result is not None and not force:
+            # A cache hit replays an older run's result under that older run's
+            # id. Link it now: the fingerprint is derived from these exact bytes
+            # and the cache is keyed by it, so this is an exact statement about
+            # where that run's rows are, not a guess. It is also what repairs a
+            # run profiled before links existed — the first time its dataset
+            # passes through again, its drill-downs start working.
+            self._link_run_to_dataset(
+                run_id=(result.cached_result.agent2_full_result or {}).get("run_id"),
+                fingerprint=result.master.fingerprint,
+                copy_id=result.copy.copy_id,
+                storage_location=result.master.storage_location,
+                original_filename=result.master.original_filename,
+                sheet_name=state.get("sheet_name"),
+                # The replayed run is older than this request. Its own sheet
+                # selection is the correct one for it; this upload's may differ.
+                preserve_existing=True,
+            )
             return {
                 "file_extension": file_extension,
                 "fingerprint": result.master.fingerprint,
                 "copy_id": result.copy.copy_id,
+                "master_storage_location": result.master.storage_location,
                 "was_cached": True,
                 "agent1_body": result.cached_result.agent1_body,
                 "agent2_full_result": result.cached_result.agent2_full_result,
@@ -438,12 +476,38 @@ class OrchestratorGraphNodes:
             "file_extension": file_extension,
             "fingerprint": result.master.fingerprint,
             "copy_id": result.copy.copy_id,
+            "master_storage_location": result.master.storage_location,
             "was_cached": False,
             # force_revalidate reaching Agent 1 as force_reclassify is what
             # makes "correct a bad past classification" actually work end
             # to end, instead of only bypassing this node's own cache.
             "force_reclassify": force,
         }
+
+    @staticmethod
+    def _link_run_to_dataset(*, run_id: str | None, fingerprint: str | None,
+                             copy_id: str | None, storage_location: str | None,
+                             original_filename: str, sheet_name: str | None,
+                             preserve_existing: bool = False) -> None:
+        """Record run -> stored dataset. Never fatal.
+
+        A missing link costs a later drill-down its recompute path; a failed
+        write must not cost the caller their pipeline run.
+        """
+        if not (run_id and fingerprint and storage_location):
+            return
+        try:
+            metadata_cache.upsert_run_dataset_link(
+                run_id=str(run_id),
+                fingerprint=fingerprint,
+                copy_id=copy_id,
+                storage_location=storage_location,
+                original_filename=original_filename,
+                sheet_name=sheet_name,
+                preserve_existing=preserve_existing,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to link run {run_id} to dataset {fingerprint}: {e}")
 
     def route_after_identity(self, state: PipelineState) -> Literal["cache_hit", "cache_miss"]:
         return "cache_hit" if state.get("was_cached") else "cache_miss"
@@ -553,6 +617,14 @@ class OrchestratorGraphNodes:
             data["business_question"] = state["business_question"]
         if state.get("target_column"):
             data["target_column"] = state["target_column"]
+        # The durable reference to these bytes. Agent 2 stores it on the run so
+        # that once its own working copy is swept it can still recompute any
+        # breakdown from the permanent copy, instead of being limited to the
+        # cubes it happened to pre-aggregate.
+        if state.get("fingerprint"):
+            data["source_fingerprint"] = state["fingerprint"]
+        if state.get("master_storage_location"):
+            data["source_dataset_uri"] = state["master_storage_location"]
 
         try:
             async with httpx.AsyncClient() as client:
@@ -593,6 +665,15 @@ class OrchestratorGraphNodes:
                     "note": note,
                 },
             }
+
+        self._link_run_to_dataset(
+            run_id=agent2_body.get("run_id"),
+            fingerprint=state.get("fingerprint"),
+            copy_id=state.get("copy_id"),
+            storage_location=state.get("master_storage_location"),
+            original_filename=state["filename"],
+            sheet_name=state.get("sheet_name"),
+        )
 
         return {
             "agent2_status_code": resp.status_code,
@@ -686,6 +767,7 @@ class OrchestratorGraphNodes:
             business_question, state["filename"], state["content"], state["content_type"],
             ml_score, llm_score, feature_columns, ml_breakdown, llm_breakdown,
             column_profiles, hierarchy, charts, full_feature_recommendation, state.get("primary_domain"),
+            state.get("explanation_mode"), state.get("persona"), state.get("custom_persona"),
         )
         return {"agent3_body": agent3_body}
 

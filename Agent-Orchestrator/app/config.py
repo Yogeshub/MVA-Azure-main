@@ -65,6 +65,34 @@ class Settings(BaseSettings):
     # absolute path for any real deployment.
     MASTER_DATASET_STORAGE_DIR: str = "./data/master-datasets"
 
+    # Where the master dataset store physically lives.
+    #
+    # "local" (default) — MASTER_DATASET_STORAGE_DIR above, a directory on a
+    #   filesystem shared with the services that need to read it back.
+    #   Everything below is ignored and the Azure SDK is never imported.
+    # "blob" — an Azure Blob container. Intended for Azure, where this service
+    #   and Agent 2 run as separate apps with separate ephemeral filesystems,
+    #   so a written path means nothing to the reader. Same content-addressed
+    #   layout, different medium; storage_location becomes an
+    #   azure-blob://<container>/<name> locator instead of a path.
+    #
+    # An explicit switch rather than something inferred from an environment
+    # label: where customer data is written should never change because an
+    # unrelated setting was mistyped, and the blob path must be exercisable
+    # outside production before it is trusted with real uploads.
+    MASTER_DATASET_BACKEND: str = "local"
+
+    # Only read when MASTER_DATASET_BACKEND == "blob". Prefer Managed Identity
+    # (ACCOUNT_URL, no secret in config) over a connection string;
+    # AZURE_BLOB_CLIENT_ID selects a user-assigned identity when several are
+    # attached. AZURE_BLOB_PREFIX must match Agent 2's, since it is part of
+    # the address.
+    AZURE_BLOB_ACCOUNT_URL: str = ""
+    AZURE_BLOB_CONTAINER: str = ""
+    AZURE_BLOB_CONNECTION_STRING: str = ""
+    AZURE_BLOB_CLIENT_ID: str = ""
+    AZURE_BLOB_PREFIX: str = "master-datasets"
+
     class Config:
         env_file = (_ROOT_ENV, ".env")
         env_file_encoding = "utf-8"

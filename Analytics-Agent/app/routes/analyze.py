@@ -8,7 +8,8 @@ that made Phase 2's orchestrator rewrite (subprocess → httpx call) possible.
 
 import json
 import logging
-from typing import Any
+import re
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
@@ -18,6 +19,9 @@ from app.schemas.responses import AnalysisResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Analytics"])
+ExplanationMode = Literal["Concise", "Standard", "Detailed", "Executive", "Step by Step"]
+Persona = Literal["Finance Analyst", "CFO", "Auditor", "Business User", "Technical User", "Custom Persona"]
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 @router.post("/analyze", response_model=AnalysisResponse)
@@ -85,6 +89,9 @@ async def analyze(
                     "by the Orchestrator. Resolves which DomainPlugin applies (PluginRegistry.find_plugin) "
                     "-- falls back to GenericDomainPlugin when omitted or unmatched.",
     ),
+    explanation_mode: ExplanationMode | None = Form(default=None),
+    persona: Persona | None = Form(default=None),
+    custom_persona: str | None = Form(default=None),
 ) -> AnalysisResponse:
     def _parse_json_field(raw: str | None, field_name: str) -> Any | None:
         if not raw:
@@ -104,6 +111,9 @@ async def analyze(
     parsed_full_feature_recommendation = _parse_json_field(
         full_feature_recommendation, "full_feature_recommendation",
     )
+    cleaned_custom_persona = _CONTROL_CHARS.sub("", custom_persona or "").strip()[:500] or None
+    if persona == "Custom Persona" and not cleaned_custom_persona:
+        raise HTTPException(status_code=422, detail="custom_persona is required when persona is Custom Persona.")
 
     content = await file.read()
     max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
@@ -128,6 +138,9 @@ async def analyze(
         charts=parsed_charts,
         full_feature_recommendation=parsed_full_feature_recommendation,
         detected_domain=detected_domain,
+        explanation_mode=explanation_mode,
+        persona=persona,
+        custom_persona=cleaned_custom_persona,
     )
 
     return AnalysisResponse(**result)

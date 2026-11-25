@@ -5,10 +5,19 @@ POST /pipeline/run, which is where Stage 0A's resolve_dataset_identity
 node actually registers new content.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+import re
+from pathlib import Path
+from uuid import UUID
+
+from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.services.dataset_registry import metadata_cache, reference_counter
+from app.services.dataset_registry import blob_storage, metadata_cache, reference_counter
+
+# A fingerprint is a SHA-256 hex digest. It reaches the filesystem, so it is
+# validated as one rather than trusted for having come through a route.
+_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 router = APIRouter(prefix="/datasets", tags=["Dataset Registry"])
 
@@ -39,6 +48,20 @@ class DatasetCopyOut(BaseModel):
     deleted_flag: bool
 
 
+class DatasetDeletionOut(BaseModel):
+    dataset_id: str
+    status: str
+    idempotent: bool
+    fingerprints: list[str]
+    active_copy_count: int
+    cached_result_count: int
+    historical_run_count: int
+    physical_deleted_count: int
+    orphaned_object_count: int
+    requested_at: str
+    completed_at: str | None
+
+
 @router.get("/masters", response_model=list[MasterDatasetOut])
 def list_masters(limit: int = Query(default=100, le=500)):
     masters = metadata_cache.list_master_datasets(limit=limit)
@@ -53,6 +76,58 @@ def list_masters(limit: int = Query(default=100, le=500)):
         )
         for m in masters
     ]
+
+
+@router.get("/masters/{fingerprint}/content")
+def get_master_content(fingerprint: str):
+    """Serve the stored bytes of a Master Dataset.
+
+    One caller: Agent 2, recomputing a drill-down for a run whose retained
+    working copy has aged out, when the two services do not share a filesystem.
+    Where they do share one, Agent 2 reads the file directly and never comes
+    here. Same trust boundary as the rest of this router — it is not exposed
+    through the public API proxy.
+    """
+    if not _FINGERPRINT.match(fingerprint):
+        raise HTTPException(status_code=400, detail="Not a valid dataset fingerprint.")
+
+    row = metadata_cache.get_master_dataset_row(fingerprint)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No Master Dataset with fingerprint {fingerprint}.")
+
+    location = row["storage_location"]
+    filename = f"{fingerprint}{row['file_extension']}"
+
+    # Under the blob backend there is no local path to serve — stream the
+    # object through instead. Same contract either way: 410 when the row
+    # promises bytes that are not actually there.
+    if blob_storage.is_blob_uri(location):
+        chunks = blob_storage.open_master_stream(location)
+        if chunks is None:
+            raise HTTPException(
+                status_code=410,
+                detail=f"The stored object for {fingerprint} is missing or unreachable.",
+            )
+        return StreamingResponse(
+            chunks,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    path = Path(location)
+    if not path.is_file():
+        # The row promises bytes that are not there. Say so plainly rather than
+        # letting the caller read it as "this dataset has no rows".
+        raise HTTPException(
+            status_code=410,
+            detail=f"The stored file for {fingerprint} is missing from {path.parent}.",
+        )
+
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=filename,
+    )
 
 
 @router.get("/masters/{fingerprint}/copies", response_model=list[DatasetCopyOut])
@@ -88,3 +163,50 @@ def delete_master(fingerprint: str, force: bool = Query(default=False)):
         status_code = 404 if reason and "not found" in reason else 409
         raise HTTPException(status_code=status_code, detail=reason)
     return {"fingerprint": fingerprint, "deleted": True}
+
+
+@router.delete("/{dataset_id}", response_model=DatasetDeletionOut)
+def delete_dataset(
+    dataset_id: str,
+    confirm: bool = Query(...),
+    deletion_actor: str | None = Header(default=None, alias="X-Deletion-Actor"),
+):
+    """Permanently delete all source versions for one stable dataset_id.
+
+    ``confirm=true`` is deliberately mandatory.  Historical run linkage and
+    deletion audit data remain, but source bytes, active copies, and cached
+    derived master results are removed.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Permanent dataset deletion requires confirm=true.",
+        )
+    try:
+        normalized_id = str(UUID(dataset_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Not a valid dataset_id.") from None
+
+    actor = (
+        deletion_actor.strip()[:200]
+        if isinstance(deletion_actor, str) and deletion_actor.strip()
+        else "direct-orchestrator-client"
+    )
+    audit = reference_counter.delete_dataset(normalized_id, requested_by=actor)
+    if audit is None:
+        raise HTTPException(status_code=404, detail=f"Dataset '{normalized_id}' not found.")
+
+    failures = audit.get("physical_cleanup_failures") or []
+    return DatasetDeletionOut(
+        dataset_id=str(audit["dataset_id"]),
+        status=audit["status"],
+        idempotent=bool(audit["idempotent"]),
+        fingerprints=list(audit["fingerprints"]),
+        active_copy_count=audit["active_copy_count"],
+        cached_result_count=audit["cached_result_count"],
+        historical_run_count=audit["historical_run_count"],
+        physical_deleted_count=audit["physical_deleted_count"],
+        orphaned_object_count=len(failures),
+        requested_at=audit["requested_at"].isoformat(),
+        completed_at=audit["completed_at"].isoformat() if audit["completed_at"] else None,
+    )

@@ -19,8 +19,10 @@ class DrillDownCube(Base):
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("profile_runs.id"), nullable=False
     )
-    chart_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("chart_specifications.id"), nullable=False
+    # Cubes are hierarchy-scoped, not chart-scoped: the pipeline builds one per
+    # (level, ancestor path) pair regardless of which chart is being viewed.
+    chart_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chart_specifications.id"), nullable=True
     )
     hierarchy_chain_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hierarchy_chains.id"), nullable=True

@@ -25,6 +25,7 @@ Covers:
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -283,6 +284,29 @@ def test_analyze_via_agent3_internal_error_body_passes_through_unchanged():
         result = _run(_analyze_via_agent3("Why?", "data.csv", b"a,b\n1,2", "text/csv", 90.0, 90.0, []))
     assert result == error_body
     assert result["status"] == "error"
+
+
+def test_analyze_via_agent3_forwards_narration_preferences_without_changing_analysis_inputs():
+    mock_resp = httpx.Response(
+        200, json={"status": "ok"}, request=httpx.Request("POST", "http://x"),
+    )
+    with patch.object(httpx.AsyncClient, "post", new=AsyncMock(return_value=mock_resp)) as post:
+        _run(_analyze_via_agent3(
+            "Why?", "data.csv", b"a,b\n1,2", "text/csv", 91.0, 92.0,
+            [{"column": "a"}], {"evidence": [1]}, {"evidence": [2]},
+            explanation_mode="Detailed", persona="Auditor",
+        ))
+
+    kwargs = post.await_args.kwargs
+    assert kwargs["files"] == {"file": ("data.csv", b"a,b\n1,2", "text/csv")}
+    assert kwargs["data"]["business_question"] == "Why?"
+    assert kwargs["data"]["ml_readiness"] == 91.0
+    assert kwargs["data"]["llm_readiness"] == 92.0
+    assert json.loads(kwargs["data"]["feature_recommendation"]) == [{"column": "a"}]
+    assert json.loads(kwargs["data"]["ml_readiness_breakdown"]) == {"evidence": [1]}
+    assert json.loads(kwargs["data"]["llm_readiness_breakdown"]) == {"evidence": [2]}
+    assert kwargs["data"]["explanation_mode"] == "Detailed"
+    assert kwargs["data"]["persona"] == "Auditor"
 
 
 # ── _infer_mandatory_and_unique ──────────────────────────────────────────────

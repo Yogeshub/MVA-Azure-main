@@ -33,6 +33,9 @@ class AnalyticsState(TypedDict, total=False):
     # failed, not just report the bare score.
     ml_readiness_breakdown: dict | None
     llm_readiness_breakdown: dict | None
+    explanation_mode: str | None
+    persona: str | None
+    custom_persona: str | None
 
     # ── Set by build_dataset_context (Stage 0) ──────────────────────────────
     # Rich (Agent 2-derived) when the Orchestrator forwarded column_profiles/

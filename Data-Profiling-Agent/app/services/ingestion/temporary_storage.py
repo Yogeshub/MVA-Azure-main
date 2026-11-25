@@ -1,5 +1,7 @@
 """Temporary file storage — run-scoped directory with cleanup guarantees."""
 
+import json
+import time
 import uuid
 import shutil
 from pathlib import Path
@@ -12,6 +14,11 @@ logger = get_logger(__name__)
 
 class TemporaryStorage:
     """Manages run-scoped temporary directories for uploaded files."""
+
+    # Sidecar holding what the loader needs to reproduce the original read
+    # (e.g. which worksheet was profiled). Kept beside the upload so no schema
+    # change is needed to re-open a retained run.
+    META_FILENAME = ".run_meta.json"
 
     def __init__(self, settings: Settings):
         self._base_dir = Path(settings.temp_storage_dir)
@@ -78,3 +85,66 @@ class TemporaryStorage:
                 shutil.rmtree(child, ignore_errors=True)
                 count += 1
         return count
+
+    def find_run_file(self, run_id: uuid.UUID) -> Path | None:
+        """Return the retained source file for a run, if it still exists.
+
+        Used by ad-hoc aggregation to go back to the rows after profiling has
+        finished. Returns None once the retention window has passed — callers
+        must treat that as "cannot answer", never as "no data".
+        """
+        run_dir = self._base_dir / str(run_id)
+        if not run_dir.exists():
+            return None
+        for child in sorted(run_dir.iterdir()):
+            if child.is_file() and child.name != self.META_FILENAME:
+                return child
+        return None
+
+    def write_run_metadata(self, run_id: uuid.UUID, meta: dict) -> None:
+        """Record how the upload was read, so a retained run can be re-opened.
+
+        Without this, a multi-sheet workbook could be profiled but never
+        re-aggregated: the loader would not know which sheet was used.
+        """
+        run_dir = self.create_run_directory(run_id)
+        try:
+            (run_dir / self.META_FILENAME).write_text(json.dumps(meta), encoding="utf-8")
+        except OSError as e:
+            logger.warning("run_metadata_write_failed", run_id=str(run_id), error=str(e))
+
+    def read_run_metadata(self, run_id: uuid.UUID) -> dict:
+        """Read the sidecar written at upload time. Empty dict if absent."""
+        path = self._base_dir / str(run_id) / self.META_FILENAME
+        if not path.exists():
+            return {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError) as e:
+            logger.warning("run_metadata_read_failed", run_id=str(run_id), error=str(e))
+            return {}
+
+    def purge_expired(self, max_age_hours: int) -> int:
+        """Delete run directories older than the retention window.
+
+        Retention is swept opportunistically (on each new run) rather than by a
+        scheduler, so a long-idle service never accumulates files silently.
+        Returns the number of directories removed.
+        """
+        if not self._base_dir.exists() or max_age_hours <= 0:
+            return 0
+        cutoff = time.time() - (max_age_hours * 3600)
+        removed = 0
+        for child in self._base_dir.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                if child.stat().st_mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info("run_files_purged", removed=removed, max_age_hours=max_age_hours)
+        return removed
